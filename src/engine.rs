@@ -209,8 +209,14 @@ impl Engine {
         let content_status_cb = self.content_status_cb.clone();
 
         // Subscribe to insert events from the replica.
+        // Use an unbounded channel so that Subscribers::send (which calls
+        // send_blocking) never blocks the sync actor.  A bounded channel
+        // here caused deadlocks: a subscriber calling doc.get_one() sends
+        // an RPC to the sync actor, but the sync actor was blocked on
+        // send_blocking waiting for the subscriber to drain — classic
+        // circular-wait deadlock (see iroh-docs#81).
         let a = {
-            let (s, r) = async_channel::bounded(SUBSCRIBE_CHANNEL_CAP);
+            let (s, r) = async_channel::unbounded();
             self.sync.subscribe(namespace, s).await?;
             Box::pin(r).then(move |ev| {
                 let content_status_cb = content_status_cb.clone();
