@@ -38,8 +38,6 @@ mod state;
 
 /// Capacity of the channel for the [`ToLiveActor`] messages.
 const ACTOR_CHANNEL_CAP: usize = 64;
-/// Capacity for the channels for [`Engine::subscribe`].
-const SUBSCRIBE_CHANNEL_CAP: usize = 256;
 
 /// The sync engine coordinates actors that manage open documents, set-reconciliation syncs with
 /// peers and a gossip swarm for each syncing document.
@@ -213,8 +211,14 @@ impl Engine {
         let content_status_cb = self.content_status_cb.clone();
 
         // Subscribe to insert events from the replica.
+        // Use an unbounded channel so that Subscribers::send (which calls
+        // send_blocking) never blocks the sync actor.  A bounded channel
+        // here caused deadlocks: a subscriber calling doc.get_one() sends
+        // an RPC to the sync actor, but the sync actor was blocked on
+        // send_blocking waiting for the subscriber to drain — classic
+        // circular-wait deadlock (see iroh-docs#81).
         let a = {
-            let (s, r) = async_channel::bounded(SUBSCRIBE_CHANNEL_CAP);
+            let (s, r) = async_channel::unbounded();
             self.sync.subscribe(namespace, s).await?;
             Box::pin(r).then(move |ev| {
                 let content_status_cb = content_status_cb.clone();
@@ -223,8 +227,13 @@ impl Engine {
         };
 
         // Subscribe to events from the [`live::Actor`].
+        // Use an unbounded channel for the same reason as stream `a`:
+        // when many documents are open, the LiveActor can block on
+        // bounded send() here while gossip receive_loop tasks block
+        // trying to send NeighborUp through the actor channel —
+        // starving NeighborUp/Down delivery entirely.
         let b = {
-            let (s, r) = async_channel::bounded(SUBSCRIBE_CHANNEL_CAP);
+            let (s, r) = async_channel::unbounded();
             let r = Box::pin(r);
             let (reply, reply_rx) = oneshot::channel();
             self.to_live_actor
