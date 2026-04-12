@@ -293,6 +293,9 @@ async fn engine_level_circular_deadlock_regression() -> Result<()> {
 
     let author = client.docs().author_create().await?;
     let doc = client.docs().create().await?;
+    // Enable live sync so the internal replica_events bridge is attached,
+    // even though we have no peers yet.
+    doc.start_sync(vec![]).await?;
 
     let mut sub = doc.subscribe().await?;
 
@@ -334,6 +337,9 @@ async fn engine_level_concurrent_writers_no_deadlock() -> Result<()> {
 
     let author = client.docs().author_create().await?;
     let doc = client.docs().create().await?;
+    // Enable live sync so writes also flow through the internal
+    // sync-actor -> LiveActor replica_events bridge.
+    doc.start_sync(vec![]).await?;
 
     // Subscribe but never drain — worst case for backpressure.
     let _sub = doc.subscribe().await?;

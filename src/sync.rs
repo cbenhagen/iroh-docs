@@ -282,9 +282,10 @@ impl ReplicaInfo {
 
     /// Subscribe to insert events.
     ///
-    /// When subscribing to a replica, you must ensure that the corresponding [`async_channel::Receiver`] is
-    /// received from in a loop. If not receiving, local and remote inserts will hang waiting for
-    /// the receiver to be received from.
+    /// When subscribing to a replica, you should ensure that the corresponding
+    /// [`async_channel::Receiver`] is drained promptly. Slow or stalled
+    /// subscribers are dropped on backpressure so they cannot block local or
+    /// remote inserts.
     pub fn subscribe(&mut self, sender: async_channel::Sender<Event>) {
         self.subscribers.subscribe(sender)
     }
