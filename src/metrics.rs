@@ -1,6 +1,6 @@
 //! Metrics for iroh-docs
 
-use iroh_metrics::{Counter, MetricsGroup};
+use iroh_metrics::{Counter, Gauge, MetricsGroup};
 
 /// Metrics for iroh-docs
 #[derive(Debug, Default, MetricsGroup)]
@@ -46,4 +46,7 @@ pub struct Metrics {
     pub doc_live_tick_running_sync_accept: Counter,
     /// Number of times the live actor processed a pending download
     pub doc_live_tick_pending_downloads: Counter,
+
+    /// Current depth of the internal replica_events queue (sync actor -> live actor)
+    pub doc_live_replica_events_queue_depth: Gauge,
 }

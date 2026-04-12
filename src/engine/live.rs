@@ -195,7 +195,7 @@ impl LiveActor {
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
-        let (replica_events_tx, replica_events_rx) = async_channel::bounded(1024);
+        let (replica_events_tx, replica_events_rx) = async_channel::unbounded();
         let gossip_state = GossipState::new(gossip, sync.clone(), sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
@@ -244,6 +244,9 @@ impl LiveActor {
             i += 1;
             trace!(?i, "tick wait");
             self.metrics.doc_live_tick_main.inc();
+            self.metrics
+                .doc_live_replica_events_queue_depth
+                .set(self.replica_events_tx.len() as i64);
             tokio::select! {
                 biased;
                 msg = self.inbox.recv() => {
@@ -265,6 +268,13 @@ impl LiveActor {
                     let event = event.context("replica_events closed")?;
                     if let Err(err) = self.on_replica_event(event).await {
                         error!(?err, "Failed to process replica event");
+                    }
+                    let depth = self.replica_events_tx.len();
+                    self.metrics
+                        .doc_live_replica_events_queue_depth
+                        .set(depth as i64);
+                    if depth > 10_000 {
+                        warn!(depth, "replica_events queue depth is high — LiveActor may be falling behind");
                     }
                 }
                 Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
@@ -1006,14 +1016,14 @@ impl Subscribers {
     }
 
     async fn send(&mut self, event: Event) -> bool {
-        let futs = self.0.iter().map(|sender| sender.send(event.clone()));
-        let res = futures_buffered::join_all(futs).await;
-        // reverse the order so removing does not shift remaining indices
-        for (i, res) in res.into_iter().enumerate().rev() {
-            if res.is_err() {
-                self.0.remove(i);
+        self.0.retain(|sender| match sender.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(async_channel::TrySendError::Full(_)) => {
+                tracing::warn!("live subscriber channel full, dropping");
+                false
             }
-        }
+            Err(async_channel::TrySendError::Closed(_)) => false,
+        });
         !self.0.is_empty()
     }
 }
