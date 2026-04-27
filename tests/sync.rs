@@ -132,6 +132,209 @@ async fn sync_simple() -> Result<()> {
     Ok(())
 }
 
+/// Drain the event stream until we have observed `NeighborUp` events from all
+/// `expected` peers. Other event variants (`SyncFinished`, `PendingContentReady`,
+/// `InsertRemote`, `ContentReady`, ...) are ignored; this lets the test be robust
+/// against the natural event chatter that surrounds a swarm join.
+async fn wait_for_neighbor_ups(
+    stream: &mut (impl Stream<Item = Result<LiveEvent>> + Unpin + Send),
+    expected: &std::collections::BTreeSet<PublicKey>,
+    timeout: Duration,
+) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    let fut = async {
+        while seen != *expected {
+            match stream.next().await {
+                Some(Ok(LiveEvent::NeighborUp(peer))) => {
+                    seen.insert(peer);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return Err(err),
+                None => bail!("event stream closed before all NeighborUp events arrived"),
+            }
+        }
+        Ok(())
+    };
+    n0_future::time::timeout(timeout, fut).await.map_err(|_| {
+        anyhow!("timeout waiting for NeighborUp events; got {seen:?}, expected {expected:?}")
+    })?
+}
+
+/// `Doc::neighbors()` returns the active gossip-neighbor view for a document.
+///
+/// Two nodes joining the same doc should each see the other peer as their single
+/// neighbor once the `NeighborUp` events have been observed.
+#[tokio::test]
+#[traced_test]
+async fn neighbors_two_nodes() -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut rng = test_rng(b"neighbors_two_nodes");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let peer0 = nodes[0].id();
+    let peer1 = nodes[1].id();
+    let doc0 = clients[0].docs().create().await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+
+    let mut events0 = doc0.subscribe().await?;
+    let doc1 = clients[1].docs().import(ticket).await?;
+    let mut events1 = doc1.subscribe().await?;
+
+    wait_for_neighbor_ups(&mut events0, &BTreeSet::from([peer1]), TIMEOUT).await?;
+    wait_for_neighbor_ups(&mut events1, &BTreeSet::from([peer0]), TIMEOUT).await?;
+
+    assert_eq!(doc0.neighbors().await?, vec![peer1]);
+    assert_eq!(doc1.neighbors().await?, vec![peer0]);
+
+    for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// `Doc::neighbors()` reflects all active gossip neighbors for a doc, not just one.
+#[tokio::test]
+#[traced_test]
+async fn neighbors_three_nodes() -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut rng = test_rng(b"neighbors_three_nodes");
+    let nodes = spawn_nodes(3, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let peer0 = nodes[0].id();
+    let peer1 = nodes[1].id();
+    let peer2 = nodes[2].id();
+
+    let doc0 = clients[0].docs().create().await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let mut events0 = doc0.subscribe().await?;
+    let doc1 = clients[1].docs().import(ticket.clone()).await?;
+    let mut events1 = doc1.subscribe().await?;
+    let doc2 = clients[2].docs().import(ticket).await?;
+    let mut events2 = doc2.subscribe().await?;
+
+    wait_for_neighbor_ups(&mut events0, &BTreeSet::from([peer1, peer2]), TIMEOUT).await?;
+    wait_for_neighbor_ups(&mut events1, &BTreeSet::from([peer0, peer2]), TIMEOUT).await?;
+    wait_for_neighbor_ups(&mut events2, &BTreeSet::from([peer0, peer1]), TIMEOUT).await?;
+
+    let n0: BTreeSet<PublicKey> = doc0.neighbors().await?.into_iter().collect();
+    let n1: BTreeSet<PublicKey> = doc1.neighbors().await?.into_iter().collect();
+    let n2: BTreeSet<PublicKey> = doc2.neighbors().await?.into_iter().collect();
+    assert_eq!(n0, BTreeSet::from([peer1, peer2]));
+    assert_eq!(n1, BTreeSet::from([peer0, peer2]));
+    assert_eq!(n2, BTreeSet::from([peer0, peer1]));
+
+    for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Regression test: `Doc::neighbors()` stays correct even when no one is consuming
+/// the subscribe stream.
+///
+/// This is the actual reason the API exists. `subscribe()` writes `NeighborUp` /
+/// `NeighborDown` events into a bounded `async_channel`, so a slow or absent
+/// subscriber loses the ability to track the neighbor set from the event stream.
+/// `Doc::neighbors()` is answered directly by `LiveActor`, which processes the
+/// gossip messages independently of any subscribers, so the snapshot must reflect
+/// joins and leaves regardless of subscriber state.
+///
+/// We deliberately never call `subscribe()` here. A peer joins, we observe it in
+/// `neighbors()`, the peer leaves, and we observe the empty set — all without
+/// touching the event stream.
+#[tokio::test]
+#[traced_test]
+async fn neighbors_snapshot_without_subscriber() -> Result<()> {
+    let mut rng = test_rng(b"neighbors_snapshot_without_subscriber");
+    let mut nodes = spawn_nodes(2, &mut rng).await?;
+    let node1 = nodes.pop().expect("two nodes");
+    let node0 = nodes.pop().expect("two nodes");
+    let peer0 = node0.id();
+    let peer1 = node1.id();
+
+    let doc0 = node0.client().docs().create().await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc1 = node1.client().docs().import(ticket).await?;
+
+    // Poll until both sides see one neighbor. We never call `subscribe()` —
+    // proving the snapshot is independent of the event stream.
+    poll_neighbors_eq(&doc0, &[peer1], TIMEOUT).await?;
+    poll_neighbors_eq(&doc1, &[peer0], TIMEOUT).await?;
+
+    // Take node0 down. The gossip layer on node1 will deliver a `NeighborDown`
+    // to its `LiveActor`. Nobody is reading subscribe events on doc1, but the
+    // snapshot must still drop peer0.
+    node0.shutdown().await?;
+    poll_neighbors_eq(&doc1, &[], TIMEOUT).await?;
+
+    node1.shutdown().await?;
+    Ok(())
+}
+
+/// Poll `doc.neighbors()` until it equals `expected` (order-insensitive), or fail
+/// with the last observed value on timeout.
+async fn poll_neighbors_eq(
+    doc: &iroh_docs::api::Doc,
+    expected: &[PublicKey],
+    timeout: Duration,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let want: BTreeSet<PublicKey> = expected.iter().copied().collect();
+    let deadline = Instant::now() + timeout;
+    let mut last: BTreeSet<PublicKey> = BTreeSet::new();
+    while Instant::now() < deadline {
+        last = doc.neighbors().await?.into_iter().collect();
+        if last == want {
+            return Ok(());
+        }
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!("timed out waiting for neighbors == {want:?}; last observed {last:?}")
+}
+
+/// `Doc::neighbors()` returns an empty list for a freshly created doc with no peers,
+/// stays empty after `leave()`, and errors after `close()`.
+#[tokio::test]
+#[traced_test]
+async fn neighbors_empty_and_after_leave_close() -> Result<()> {
+    let mut rng = test_rng(b"neighbors_empty_and_after_leave_close");
+    let node = spawn_node(0, &mut rng).await?;
+    let client = node.client();
+
+    let doc = client.docs().create().await?;
+    assert!(
+        doc.neighbors().await?.is_empty(),
+        "freshly created doc should have no gossip neighbors"
+    );
+
+    // `leave` ends the gossip swarm membership but keeps the doc handle open.
+    doc.leave().await?;
+    assert!(
+        doc.neighbors().await?.is_empty(),
+        "after leave, neighbors should remain empty"
+    );
+
+    // `close` flips the doc handle to closed; subsequent calls must error.
+    doc.close().await?;
+    assert!(
+        doc.neighbors().await.is_err(),
+        "after close, neighbors should error on the closed doc handle"
+    );
+
+    node.shutdown().await?;
+    Ok(())
+}
+
 /// Test subscribing to replica events (without sync)
 #[tokio::test]
 #[traced_test]

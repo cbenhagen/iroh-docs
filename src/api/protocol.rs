@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use bytes::Bytes;
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, PublicKey};
 use iroh_blobs::{api::blobs::ExportMode, Hash};
 use irpc::{
     channel::{mpsc, oneshot},
@@ -243,6 +243,16 @@ pub struct GetSyncPeersResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetNeighborsRequest {
+    pub doc_id: NamespaceId,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetNeighborsResponse {
+    pub peers: Vec<PublicKey>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthorListRequest;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -349,6 +359,8 @@ pub enum DocsProtocol {
     SetDownloadPolicy(SetDownloadPolicyRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<GetSyncPeersResponse>>)]
     GetSyncPeers(GetSyncPeersRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<GetNeighborsResponse>>)]
+    GetNeighbors(GetNeighborsRequest),
     #[rpc(tx = mpsc::Sender<RpcResult<AuthorListResponse>>)]
     AuthorList(AuthorListRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<AuthorCreateResponse>>)]

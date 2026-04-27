@@ -15,7 +15,7 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, PublicKey};
 use iroh_blobs::{
     api::blobs::{AddPathOptions, AddProgressItem, ExportMode, ExportOptions, ExportProgress},
     Hash,
@@ -28,10 +28,10 @@ use self::{
         AddrInfoOptions, AuthorCreateRequest, AuthorDeleteRequest, AuthorExportRequest,
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
-        GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetSyncPeersRequest,
-        ImportRequest, LeaveRequest, ListRequest, OpenRequest, SetDownloadPolicyRequest,
-        SetHashRequest, SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest,
-        SubscribeRequest,
+        GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetNeighborsRequest,
+        GetSyncPeersRequest, ImportRequest, LeaveRequest, ListRequest, OpenRequest,
+        SetDownloadPolicyRequest, SetHashRequest, SetRequest, ShareMode, ShareRequest,
+        StartSyncRequest, StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -109,6 +109,7 @@ impl DocsApi {
                     DocsProtocol::GetDownloadPolicy(msg) => local.send((msg, tx)).await,
                     DocsProtocol::SetDownloadPolicy(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetSyncPeers(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::GetNeighbors(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorList(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorCreate(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorGetDefault(msg) => local.send((msg, tx)).await,
@@ -559,6 +560,33 @@ impl Doc {
         let response = self
             .inner
             .rpc(GetSyncPeersRequest {
+                doc_id: self.namespace_id,
+            })
+            .await??;
+        Ok(response.peers)
+    }
+
+    /// Returns the current set of direct gossip neighbors for this document.
+    ///
+    /// These are the peers we are currently exchanging document updates with via gossip
+    /// — the active view of the iroh-gossip swarm for this document's topic. The set is
+    /// maintained internally from the same [`LiveEvent::NeighborUp`] /
+    /// [`LiveEvent::NeighborDown`] events that [`Self::subscribe`] yields, so callers can
+    /// use this method to obtain an authoritative snapshot (for example to bootstrap state
+    /// or recover from a dropped event) and rely on `subscribe` for live updates.
+    ///
+    /// This is distinct from [`Self::get_sync_peers`], which returns a persisted cache of
+    /// peers we have *previously* sync'd with (and which is not removed when a peer
+    /// disconnects). Use `neighbors` for "who am I currently meshed with?" telemetry, and
+    /// `get_sync_peers` for "who has been useful to sync with for this document?".
+    ///
+    /// Returns an empty `Vec` if the document is not currently joined to a swarm, or if
+    /// the swarm has no other direct neighbors yet.
+    pub async fn neighbors(&self) -> Result<Vec<PublicKey>> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(GetNeighborsRequest {
                 doc_id: self.namespace_id,
             })
             .await??;
