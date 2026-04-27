@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -108,6 +108,11 @@ pub enum ToLiveActor {
         namespace: NamespaceId,
         peer: PublicKey,
     },
+    Neighbors {
+        namespace: NamespaceId,
+        #[debug("oneshot::Sender")]
+        reply: sync::oneshot::Sender<Vec<PublicKey>>,
+    },
 }
 
 /// Events informing about actions of the live sync progress.
@@ -177,6 +182,13 @@ pub struct LiveActor {
     /// Subscribers to actor events
     subscribers: SubscribersMap,
 
+    /// Authoritative set of currently active gossip neighbors per namespace.
+    ///
+    /// Maintained from the same `NeighborUp` / `NeighborDown` messages that drive
+    /// `subscribers`, but kept here so callers can request a snapshot without
+    /// having to count subscriber events themselves.
+    neighbors: NeighborsMap,
+
     /// Sync state per replica and peer
     state: NamespaceStates,
     metrics: Arc<Metrics>,
@@ -212,6 +224,7 @@ impl LiveActor {
             running_sync_connect: Default::default(),
             running_sync_accept: Default::default(),
             subscribers: Default::default(),
+            neighbors: Default::default(),
             download_tasks: Default::default(),
             state: Default::default(),
             missing_hashes: Default::default(),
@@ -304,6 +317,7 @@ impl LiveActor {
             }
             ToLiveActor::NeighborUp { namespace, peer } => {
                 debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor up");
+                self.neighbors.insert(namespace, peer);
                 self.sync_with_peer(namespace, peer, SyncReason::NewNeighbor);
                 self.subscribers
                     .send(&namespace, Event::NeighborUp(peer))
@@ -311,9 +325,14 @@ impl LiveActor {
             }
             ToLiveActor::NeighborDown { namespace, peer } => {
                 debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor down");
+                self.neighbors.remove(&namespace, &peer);
                 self.subscribers
                     .send(&namespace, Event::NeighborDown(peer))
                     .await;
+            }
+            ToLiveActor::Neighbors { namespace, reply } => {
+                let peers = self.neighbors.snapshot(&namespace);
+                reply.send(peers).ok();
             }
             ToLiveActor::StartSync {
                 namespace,
@@ -387,6 +406,7 @@ impl LiveActor {
     async fn shutdown(&mut self) -> anyhow::Result<()> {
         // cancel all subscriptions
         self.subscribers.clear();
+        self.neighbors.clear();
         let (gossip_shutdown_res, _store) = tokio::join!(
             // quit the gossip topics and task loops.
             self.gossip.shutdown(),
@@ -454,6 +474,7 @@ impl LiveActor {
                 .await?;
             self.sync.close(namespace).await?;
             self.gossip.quit(&namespace);
+            self.neighbors.drop_namespace(&namespace);
         }
         if kill_subscribers {
             self.subscribers.remove(&namespace);
@@ -882,6 +903,43 @@ impl SubscribersMap {
     }
 
     fn remove(&mut self, namespace: &NamespaceId) {
+        self.0.remove(namespace);
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Tracks the set of currently active gossip neighbors per namespace.
+///
+/// Updated by the same `NeighborUp` / `NeighborDown` events that drive
+/// [`SubscribersMap`], cleared on `leave` / `shutdown`. Returns a sorted
+/// snapshot, suitable for telemetry and bootstrapping callers that want an
+/// authoritative view without having to count subscriber events themselves.
+#[derive(Debug, Default)]
+struct NeighborsMap(HashMap<NamespaceId, BTreeSet<PublicKey>>);
+
+impl NeighborsMap {
+    fn insert(&mut self, namespace: NamespaceId, peer: PublicKey) -> bool {
+        self.0.entry(namespace).or_default().insert(peer)
+    }
+
+    fn remove(&mut self, namespace: &NamespaceId, peer: &PublicKey) -> bool {
+        self.0
+            .get_mut(namespace)
+            .map(|set| set.remove(peer))
+            .unwrap_or(false)
+    }
+
+    fn snapshot(&self, namespace: &NamespaceId) -> Vec<PublicKey> {
+        self.0
+            .get(namespace)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn drop_namespace(&mut self, namespace: &NamespaceId) {
         self.0.remove(namespace);
     }
 

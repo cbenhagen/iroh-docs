@@ -182,6 +182,25 @@ impl Engine {
         Ok(())
     }
 
+    /// Returns the current set of direct gossip neighbors for `namespace`.
+    ///
+    /// These are the peers we are currently exchanging document updates with via gossip
+    /// (the active view of the iroh-gossip swarm for this document's topic). The set is
+    /// maintained internally from the same [`LiveEvent::NeighborUp`] / [`LiveEvent::NeighborDown`]
+    /// events that [`Self::subscribe`] yields, so callers can use this method to obtain an
+    /// authoritative snapshot — for example to bootstrap state or recover from a dropped
+    /// event — and rely on `subscribe` for live updates.
+    ///
+    /// Returns an empty `Vec` if the document is not currently joined to a swarm, or has no
+    /// direct neighbors yet.
+    pub async fn neighbors(&self, namespace: NamespaceId) -> Result<Vec<PublicKey>> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::Neighbors { namespace, reply })
+            .await?;
+        Ok(reply_rx.await?)
+    }
+
     /// Stop the live sync for a document and leave the gossip swarm.
     ///
     /// If `kill_subscribers` is true, all existing event subscribers will be dropped. This means

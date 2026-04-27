@@ -16,11 +16,12 @@ use super::{
         CloseResponse, CreateRequest, CreateResponse, DelRequest, DelResponse, DocsMessage,
         DocsProtocol, DropRequest, DropResponse, GetDownloadPolicyRequest,
         GetDownloadPolicyResponse, GetExactRequest, GetExactResponse, GetManyRequest,
-        GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse, LeaveRequest,
-        LeaveResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest, SetHashResponse,
-        SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse, StartSyncRequest,
-        StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest, SubscribeResponse,
+        GetNeighborsRequest, GetNeighborsResponse, GetSyncPeersRequest, GetSyncPeersResponse,
+        ImportRequest, ImportResponse, LeaveRequest, LeaveResponse, ListRequest, ListResponse,
+        OpenRequest, OpenResponse, SetDownloadPolicyRequest, SetDownloadPolicyResponse,
+        SetHashRequest, SetHashResponse, SetRequest, SetResponse, ShareMode, ShareRequest,
+        ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest, StatusResponse,
+        SubscribeRequest, SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -174,6 +175,13 @@ impl RpcActor {
                 let result = self.doc_get_sync_peers(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send GetSyncPeers response: {}", e);
+                }
+            }
+            DocsMessage::GetNeighbors(get_neighbors) => {
+                let WithChannels { tx, inner, .. } = get_neighbors;
+                let result = self.doc_get_neighbors(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send GetNeighbors response: {}", e);
                 }
             }
             DocsMessage::AuthorList(author_list) => {
@@ -597,5 +605,17 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(GetSyncPeersResponse { peers })
+    }
+
+    pub(super) async fn doc_get_neighbors(
+        &self,
+        req: GetNeighborsRequest,
+    ) -> RpcResult<GetNeighborsResponse> {
+        let peers = self
+            .engine
+            .neighbors(req.doc_id)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(GetNeighborsResponse { peers })
     }
 }
