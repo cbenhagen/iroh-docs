@@ -16,7 +16,11 @@ use iroh_blobs::{
     Hash, HashAndFormat,
 };
 use iroh_gossip::net::Gossip;
-use n0_future::{task::JoinSet, time::SystemTime, FutureExt};
+use n0_future::{
+    task::{AbortOnDropHandle, JoinSet},
+    time::SystemTime,
+    FutureExt,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{self, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
@@ -142,6 +146,8 @@ type SyncConnectRes = (
 type SyncAcceptRes = Result<SyncFinished, AcceptError>;
 type DownloadRes = (NamespaceId, Hash, Result<(), anyhow::Error>);
 
+const REPLICA_EVENTS_WARN_THRESHOLD: usize = 10_000;
+
 // Currently peers might double-sync in both directions.
 pub struct LiveActor {
     /// Receiver for actor messages.
@@ -179,6 +185,7 @@ pub struct LiveActor {
     /// Sync state per replica and peer
     state: NamespaceStates,
     metrics: Arc<Metrics>,
+    _replica_events_monitor: AbortOnDropHandle<()>,
 }
 impl LiveActor {
     /// Create the live actor.
@@ -193,9 +200,17 @@ impl LiveActor {
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
-        let (replica_events_tx, replica_events_rx) = async_channel::bounded(1024);
+        let (replica_events_tx, replica_events_rx) = async_channel::unbounded();
         let gossip_state = GossipState::new(gossip, sync.clone(), sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
+        let monitor_tx = replica_events_tx.clone();
+        let monitor_metrics = metrics.clone();
+        let replica_events_monitor = AbortOnDropHandle::new(n0_future::task::spawn(async move {
+            loop {
+                report_replica_events_queue_depth(&monitor_metrics, monitor_tx.len());
+                n0_future::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }));
         endpoint.address_lookup()?.add(memory_lookup.clone());
         Ok(Self {
             inbox,
@@ -217,6 +232,7 @@ impl LiveActor {
             queued_hashes: Default::default(),
             hash_providers: Default::default(),
             metrics,
+            _replica_events_monitor: replica_events_monitor,
         })
     }
 
@@ -242,6 +258,7 @@ impl LiveActor {
             i += 1;
             trace!(?i, "tick wait");
             self.metrics.doc_live_tick_main.inc();
+            report_replica_events_queue_depth(&self.metrics, self.replica_events_tx.len());
             tokio::select! {
                 biased;
                 msg = self.inbox.recv() => {
@@ -264,6 +281,7 @@ impl LiveActor {
                     if let Err(err) = self.on_replica_event(event).await {
                         error!(?err, "Failed to process replica event");
                     }
+                    report_replica_events_queue_depth(&self.metrics, self.replica_events_tx.len());
                 }
                 Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
                     trace!(?i, "tick: running_sync_connect");
@@ -828,6 +846,18 @@ impl LiveActor {
     }
 }
 
+fn report_replica_events_queue_depth(metrics: &Metrics, depth: usize) {
+    metrics
+        .doc_live_replica_events_queue_depth
+        .set(depth as i64);
+    if depth > REPLICA_EVENTS_WARN_THRESHOLD {
+        warn!(
+            depth,
+            "replica_events queue depth is high — LiveActor may be falling behind"
+        );
+    }
+}
+
 /// Event emitted when a sync operation completes
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SyncEvent {
@@ -955,14 +985,15 @@ impl Subscribers {
     }
 
     async fn send(&mut self, event: Event) -> bool {
-        let futs = self.0.iter().map(|sender| sender.send(event.clone()));
-        let res = futures_buffered::join_all(futs).await;
-        // reverse the order so removing does not shift remaining indices
-        for (i, res) in res.into_iter().enumerate().rev() {
-            if res.is_err() {
-                self.0.remove(i);
-            }
-        }
+        self.0
+            .retain(|sender| match sender.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(async_channel::TrySendError::Full(_)) => {
+                    tracing::warn!("live subscriber channel full, dropping");
+                    false
+                }
+                Err(async_channel::TrySendError::Closed(_)) => false,
+            });
         !self.0.is_empty()
     }
 }
