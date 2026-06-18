@@ -21,10 +21,7 @@ use bytes::{Bytes, BytesMut};
 // `SignedEntry` format independent of upstream `ed25519` serde changes.
 use iroh::{KeyParsingError, Signature, SignatureError};
 use iroh_blobs::Hash;
-use n0_future::{
-    time::{Duration, SystemTime},
-    IterExt,
-};
+use n0_future::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 pub use crate::heads::AuthorHeads;
@@ -142,14 +139,14 @@ impl Subscribers {
         self.0.retain(|s| !same_channel(s, sender));
     }
     pub async fn send(&mut self, event: Event) {
-        self.0 = std::mem::take(&mut self.0)
-            .into_iter()
-            .map(async |tx| tx.send(event.clone()).await.ok().map(|_| tx))
-            .join_all()
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
+        self.0.retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(async_channel::TrySendError::Full(_)) => {
+                tracing::warn!("subscriber channel full, dropping");
+                false
+            }
+            Err(async_channel::TrySendError::Closed(_)) => false,
+        });
     }
     pub fn len(&self) -> usize {
         self.0.len()
@@ -294,9 +291,10 @@ impl ReplicaInfo {
 
     /// Subscribe to insert events.
     ///
-    /// When subscribing to a replica, you must ensure that the corresponding [`async_channel::Receiver`] is
-    /// received from in a loop. If not receiving, local and remote inserts will hang waiting for
-    /// the receiver to be received from.
+    /// When subscribing to a replica, you should ensure that the corresponding
+    /// [`async_channel::Receiver`] is drained promptly. Slow or stalled
+    /// subscribers are dropped on backpressure so they cannot block local or
+    /// remote inserts.
     pub fn subscribe(&mut self, sender: async_channel::Sender<Event>) {
         self.subscribers.subscribe(sender)
     }
