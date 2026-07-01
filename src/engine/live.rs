@@ -184,6 +184,12 @@ pub struct LiveActor {
     queued_hashes: QueuedHashes,
     /// Nodes known to have a hash
     hash_providers: ProviderNodes,
+    /// Per-blob backoff so a blob with no provider isn't re-requested on every re-scan.
+    blob_recheck_backoff: HashMap<Hash, BlobRecheckBackoff>,
+    /// Last incomplete-blob scan time per (namespace, peer), to debounce the scan.
+    last_incomplete_check: HashMap<(NamespaceId, PublicKey), n0_future::time::Instant>,
+    /// Minimum interval between incomplete-blob scans per (namespace, peer); zero scans every sync.
+    incomplete_blob_check_interval: std::time::Duration,
 
     /// Subscribers to actor events
     subscribers: SubscribersMap,
@@ -212,6 +218,7 @@ impl LiveActor {
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         metrics: Arc<Metrics>,
+        incomplete_blob_check_interval: Option<std::time::Duration>,
     ) -> Result<Self> {
         let (replica_events_tx, replica_events_rx) = async_channel::unbounded();
         let gossip_state = GossipState::new(gossip, sync.clone(), sync_actor_tx.clone());
@@ -245,6 +252,10 @@ impl LiveActor {
             missing_hashes: Default::default(),
             queued_hashes: Default::default(),
             hash_providers: Default::default(),
+            blob_recheck_backoff: Default::default(),
+            last_incomplete_check: Default::default(),
+            incomplete_blob_check_interval: incomplete_blob_check_interval
+                .unwrap_or(DEFAULT_INCOMPLETE_BLOB_CHECK_DEBOUNCE),
             metrics,
             _replica_events_monitor: replica_events_monitor,
         })
@@ -694,6 +705,8 @@ impl LiveActor {
         let completed_namespaces = self.queued_hashes.remove_hash(&hash);
         debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), completed_namespaces=completed_namespaces.len(), "download ready");
         if res.is_ok() {
+            // Recovered: drop the re-request backoff.
+            self.blob_recheck_backoff.remove(&hash);
             self.subscribers
                 .send(&namespace, Event::ContentReady { hash })
                 .await;
@@ -791,6 +804,17 @@ impl LiveActor {
     /// the in-memory `missing_hashes` set) get another download attempt with `peer` as a
     /// candidate provider.
     async fn check_incomplete_blobs(&mut self, namespace: NamespaceId, peer: PublicKey) {
+        // Debounce per (namespace, peer): a newly-synced peer scans promptly, repeated syncs with
+        // the same peer collapse.
+        let debounce_key = (namespace, peer);
+        if let Some(last) = self.last_incomplete_check.get(&debounce_key) {
+            if last.elapsed() < self.incomplete_blob_check_interval {
+                return;
+            }
+        }
+        self.last_incomplete_check
+            .insert(debounce_key, n0_future::time::Instant::now());
+
         let policy = match self.sync.get_download_policy(namespace).await {
             Ok(policy) => policy,
             Err(e) => {
@@ -822,8 +846,27 @@ impl LiveActor {
                 continue;
             }
             let hash = entry.content_hash();
-            self.start_download(namespace, hash, peer, false).await;
-            queued += 1;
+            // Already complete: drop any stale backoff.
+            if matches!(
+                self.bao_store.blobs().status(hash).await,
+                Ok(BlobStatus::Complete { .. })
+            ) {
+                self.blob_recheck_backoff.remove(&hash);
+                continue;
+            }
+            // Always try a peer not yet offered for this hash ("retry from second peer"); only
+            // back off re-requests to peers already tried.
+            let untried_peer = !self.hash_providers.contains(&hash, &peer);
+            if untried_peer
+                || self
+                    .blob_recheck_backoff
+                    .entry(hash)
+                    .or_default()
+                    .should_request(MAX_BLOB_RECHECK_BACKOFF)
+            {
+                self.start_download(namespace, hash, peer, false).await;
+                queued += 1;
+            }
         }
         if queued > 0 {
             debug!(namespace=%namespace.fmt_short(), %queued, "queued incomplete blob downloads after sync");
@@ -1033,8 +1076,49 @@ struct QueuedHashes {
     by_namespace: HashMap<NamespaceId, HashSet<Hash>>,
 }
 
+/// Default interval for the after-sync incomplete-blob scan when the builder does not override it.
+const DEFAULT_INCOMPLETE_BLOB_CHECK_DEBOUNCE: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Cap, in re-scan passes, on the per-blob re-request backoff window.
+const MAX_BLOB_RECHECK_BACKOFF: u32 = 64;
+
+/// Per-blob exponential backoff for the incomplete-blob re-scan: request, then skip a doubling
+/// number of passes (capped at [`MAX_BLOB_RECHECK_BACKOFF`]) before the next request.
+#[derive(Debug, Default)]
+struct BlobRecheckBackoff {
+    /// Remaining re-scan passes to skip before the next re-request.
+    skip: u32,
+    /// Current backoff window in passes; doubles after each re-request up to the cap.
+    window: u32,
+}
+
+impl BlobRecheckBackoff {
+    /// Advance one re-scan pass; return whether the blob should be re-requested now.
+    fn should_request(&mut self, max_window: u32) -> bool {
+        if self.skip > 0 {
+            self.skip -= 1;
+            return false;
+        }
+        self.window = self.window.saturating_mul(2).clamp(1, max_window);
+        self.skip = self.window;
+        true
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProviderNodes(Arc<std::sync::Mutex<HashMap<Hash, HashSet<EndpointId>>>>);
+
+impl ProviderNodes {
+    /// Whether `node` has already been recorded as a candidate provider for `hash`.
+    fn contains(&self, hash: &Hash, node: &EndpointId) -> bool {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .get(hash)
+            .is_some_and(|nodes| nodes.contains(node))
+    }
+}
 
 impl ContentDiscovery for ProviderNodes {
     fn find_providers(&self, hash: HashAndFormat) -> n0_future::stream::Boxed<EndpointId> {
@@ -1141,5 +1225,14 @@ mod tests {
         drop(a_rx);
         drop(b_rx);
         subscribers.send(Event::NeighborUp(pk)).await;
+    }
+
+    #[test]
+    fn blob_recheck_backoff_is_exponential_and_capped() {
+        let max = 8;
+        let mut b = BlobRecheckBackoff::default();
+        let requested: Vec<u32> = (0..30).filter(|_| b.should_request(max)).collect();
+        // First pass requests, then gaps double (1, 2, 4, 8) and stay capped at 8.
+        assert_eq!(requested, vec![0, 2, 5, 10, 19, 28]);
     }
 }
