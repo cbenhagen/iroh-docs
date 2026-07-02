@@ -11,7 +11,7 @@ use iroh::{
     tls::CaTlsConfig,
     Endpoint, EndpointId, RelayMap, RelayMode, SecretKey,
 };
-use iroh_blobs::store::GcConfig;
+use iroh_blobs::{store::GcConfig, util::connection_pool};
 use iroh_docs::{engine::ProtectCallbackHandler, protocol::Docs};
 use iroh_gossip::net::Gossip;
 use n0_error::Result;
@@ -81,6 +81,7 @@ pub struct Builder {
     gc_interval: Option<n0_future::time::Duration>,
     #[debug(skip)]
     register_gc_done_cb: Option<Box<dyn Fn() + Send + 'static>>,
+    download_pool_options: Option<connection_pool::Options>,
 }
 
 impl Builder {
@@ -102,6 +103,9 @@ impl Builder {
         }
         // Scan on every sync in tests (deterministic); production debounces.
         docs_builder = docs_builder.incomplete_blob_check_interval(std::time::Duration::ZERO);
+        if let Some(options) = self.download_pool_options.clone() {
+            docs_builder = docs_builder.download_pool_options(options);
+        }
         let docs = match docs_builder
             .spawn(self.endpoint.clone(), blobs.clone(), gossip.clone())
             .await
@@ -131,6 +135,11 @@ impl Builder {
         self
     }
 
+    pub fn download_pool_options(mut self, value: connection_pool::Options) -> Self {
+        self.download_pool_options = Some(value);
+        self
+    }
+
     pub fn register_gc_done_cb(mut self, value: Box<dyn Fn() + Send + Sync>) -> Self {
         self.register_gc_done_cb = Some(value);
         self
@@ -142,6 +151,7 @@ impl Builder {
             storage,
             gc_interval: None,
             register_gc_done_cb: None,
+            download_pool_options: None,
         }
     }
 }

@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint};
-use iroh_blobs::api::Store as BlobsStore;
+use iroh_blobs::{
+    api::{downloader::Downloader, Store as BlobsStore},
+    util::connection_pool,
+};
 use iroh_gossip::net::Gossip;
 
 use crate::{
@@ -87,6 +90,7 @@ pub struct Builder {
     storage: Storage,
     protect_cb: Option<ProtectCallbackHandler>,
     incomplete_blob_check_interval: Option<std::time::Duration>,
+    download_pool_options: Option<connection_pool::Options>,
 }
 
 impl Builder {
@@ -104,6 +108,18 @@ impl Builder {
     /// See [`ProtectCallbackHandler::new`] for details.
     pub fn protect_handler(mut self, protect_handler: ProtectCallbackHandler) -> Self {
         self.protect_cb = Some(protect_handler);
+        self
+    }
+
+    /// Set the connection-pool [`Options`] for the content downloader.
+    ///
+    /// Notably [`Options::idle_timeout`] controls how long a connection is kept for reuse
+    /// across separate content fetches. If unset, the downloader's defaults are used.
+    ///
+    /// [`Options`]: connection_pool::Options
+    /// [`Options::idle_timeout`]: connection_pool::Options::idle_timeout
+    pub fn download_pool_options(mut self, options: connection_pool::Options) -> Self {
+        self.download_pool_options = Some(options);
         self
     }
 
@@ -126,7 +142,10 @@ impl Builder {
                 DefaultAuthorStorage::Persistent(path.join("default-author"))
             }
         };
-        let downloader = blobs.downloader(&endpoint);
+        let downloader = match self.download_pool_options {
+            Some(options) => Downloader::new_with_opts(&blobs, &endpoint, options),
+            None => blobs.downloader(&endpoint),
+        };
         let engine = Engine::spawn(
             endpoint,
             gossip,

@@ -3,7 +3,7 @@ use std::{collections::HashMap, future::Future, sync::Arc};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use iroh::{endpoint::presets, Endpoint, PublicKey, SecretKey};
-use iroh_blobs::Hash;
+use iroh_blobs::{util::connection_pool, Hash};
 use iroh_docs::{
     api::{
         protocol::{AddrInfoOptions, ShareMode},
@@ -130,6 +130,58 @@ async fn sync_simple() -> Result<()> {
     for node in nodes {
         node.shutdown().await?;
     }
+    Ok(())
+}
+
+/// Content still syncs when the subscribing node sets custom download-pool options
+/// (a non-default connection-pool idle timeout).
+#[tokio::test]
+#[traced_test]
+async fn sync_with_custom_download_pool() -> Result<()> {
+    let mut rng = test_rng(b"sync_with_custom_download_pool");
+
+    // Writer keeps the default pool; reader uses a long download-pool idle timeout.
+    let node0 = spawn_node(0, &mut rng).await?;
+    let ep1 = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&rng.random()))
+        .bind()
+        .await?;
+    let node1 = Node::memory(ep1)
+        .download_pool_options(connection_pool::Options {
+            idle_timeout: Duration::from_secs(120),
+            ..Default::default()
+        })
+        .spawn()
+        .await?;
+
+    let peer0 = node0.id();
+    let author0 = node0.docs().author_create().await?;
+    let doc0 = node0.docs().create().await?;
+    let hash0 = doc0
+        .set_bytes(author0, b"k1".to_vec(), b"v1".to_vec())
+        .await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+
+    let doc1 = node1.docs().import(ticket).await?;
+    let mut events1 = doc1.subscribe().await?;
+    assert_next_unordered(
+        &mut events1,
+        TIMEOUT,
+        vec![
+            Box::new(move |e| matches!(e, LiveEvent::NeighborUp(peer) if *peer == peer0)),
+            Box::new(move |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == peer0)),
+            Box::new(move |e| match_sync_finished(e, peer0)),
+            Box::new(move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == hash0)),
+            match_event!(LiveEvent::PendingContentReady),
+        ],
+    )
+    .await;
+    assert_latest(node1.blobs(), &doc1, b"k1", b"v1").await;
+
+    node0.shutdown().await?;
+    node1.shutdown().await?;
     Ok(())
 }
 
