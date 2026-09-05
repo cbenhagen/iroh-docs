@@ -53,12 +53,53 @@ impl RecordsBounds {
         Self::new(Self::namespace_start(&ns), Self::namespace_end(&ns))
     }
 
-    pub fn from_start(ns: &NamespaceId, end: Bound<RecordsIdOwned>) -> Self {
-        Self::new(Self::namespace_start(ns), end)
-    }
-
-    pub fn to_end(ns: &NamespaceId, start: Bound<RecordsIdOwned>) -> Self {
-        Self::new(start, Self::namespace_end(ns))
+    /// Returns bounds for an untrusted `start`..`end`, intersected with the keys of `ns`.
+    ///
+    /// Every namespace shares one records table, so the bounds are the only thing keeping
+    /// documents apart. Sync range endpoints arrive from the remote peer unvalidated and
+    /// may name any namespace, so they have to be intersected with the namespace the
+    /// session is pinned to. A range reaching into another document then selects nothing
+    /// instead of reading it.
+    ///
+    /// This is the only constructor that accepts remote input.
+    pub fn untrusted(
+        ns: &NamespaceId,
+        start: Bound<RecordsIdOwned>,
+        end: Bound<RecordsIdOwned>,
+    ) -> Self {
+        // The tighter of two lower bounds is the greater one, and vice versa for upper bounds.
+        let ns_start = (ns.to_bytes(), [0u8; 32], Bytes::new());
+        let start = match start {
+            Bound::Included(start) if start > ns_start => Bound::Included(start),
+            Bound::Excluded(start) if start >= ns_start => Bound::Excluded(start),
+            _ => Bound::Included(ns_start),
+        };
+        // `namespace_end` is `Unbounded` for the last namespace, which no end can exceed.
+        let end = match (end, Self::namespace_end(ns)) {
+            (Bound::Unbounded, ns_end) => ns_end,
+            (end, Bound::Unbounded) => end,
+            (Bound::Included(end), Bound::Excluded(ns_end)) if end < ns_end => Bound::Included(end),
+            (Bound::Excluded(end), Bound::Excluded(ns_end)) if end <= ns_end => {
+                Bound::Excluded(end)
+            }
+            (_, ns_end) => ns_end,
+        };
+        // A range naming only foreign namespaces intersects to nothing. Normalize that to an
+        // explicitly empty range: redb tolerates inverted bounds, but `RecordsBounds` is a
+        // `RangeBounds`, and `BTreeMap::range` panics on them.
+        let inverted = match (&start, &end) {
+            (Bound::Included(start), Bound::Included(end)) => start > end,
+            (
+                Bound::Included(start) | Bound::Excluded(start),
+                Bound::Included(end) | Bound::Excluded(end),
+            ) => start >= end,
+            _ => false,
+        };
+        if inverted {
+            let empty = (ns.to_bytes(), [0u8; 32], Bytes::new());
+            return Self(Bound::Included(empty.clone()), Bound::Excluded(empty));
+        }
+        Self(start, end)
     }
 
     pub fn as_ref(&self) -> (Bound<RecordsId<'_>>, Bound<RecordsId<'_>>) {
