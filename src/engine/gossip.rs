@@ -210,6 +210,9 @@ async fn receive_loop(
                     .send(ToLiveActor::NeighborDown { namespace, peer })
                     .await?;
             }
+            // `Event` is `#[non_exhaustive]` since iroh-gossip #198.
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
     Ok(())
