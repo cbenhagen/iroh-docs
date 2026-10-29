@@ -764,6 +764,11 @@ impl LiveActor {
                     if matches!(remote_content_status, ContentStatus::Complete) {
                         let node_id = PublicKey::from_bytes(&from)?;
                         self.start_download(namespace, hash, node_id, false).await;
+                    } else if let Some(provider) = self.hash_providers.any_provider(&hash) {
+                        // A provider already signalled this content, e.g. a gossip
+                        // `ContentReady` that arrived before the entry did. That signal is
+                        // spent, so parking the hash would wait for the next one.
+                        self.start_download(namespace, hash, provider, false).await;
                     } else {
                         self.missing_hashes.insert(hash);
                     }
@@ -1242,6 +1247,72 @@ mod tests {
         );
         assert!(actor.missing_hashes.contains(&hash));
         assert!(!actor.queued_hashes.contains_hash(&hash));
+        Ok(())
+    }
+
+    /// A `ContentReady` that arrives before its entry is spent without a download (the hash
+    /// is not parked yet). When the entry then comes from a peer without the content, it must
+    /// be fetched from the provider that signalled, not parked until the next signal.
+    #[tokio::test]
+    async fn entry_after_content_ready_is_fetched_from_the_signalled_provider() -> Result<()> {
+        let mut actor = test_actor().await?;
+        let namespace_secret = crate::NamespaceSecret::new(&mut rand::rng());
+        let namespace = namespace_secret.id();
+        let author = crate::Author::new(&mut rand::rng());
+        let hash = Hash::new(b"content the provider has");
+        let provider = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let relay = iroh::SecretKey::from_bytes(&[2; 32]).public();
+
+        // ContentReady before the entry: provider recorded, nothing started.
+        actor
+            .on_neighbor_content_ready(namespace, provider, hash)
+            .await;
+        assert_eq!(actor.download_tasks.len(), 0);
+        assert!(actor.hash_providers.contains(&hash, &provider));
+
+        // The entry arrives from a relay that does not have the content.
+        let entry = crate::SignedEntry::from_parts(
+            &namespace_secret,
+            &author,
+            b"key",
+            crate::Record::new_current(hash, 24),
+        );
+        actor
+            .on_replica_event(crate::Event::RemoteInsert {
+                namespace,
+                entry,
+                from: *relay.as_bytes(),
+                should_download: true,
+                remote_content_status: ContentStatus::Missing,
+            })
+            .await?;
+        assert_eq!(
+            actor.download_tasks.len(),
+            1,
+            "must fetch from the known provider"
+        );
+        assert!(actor.queued_hashes.contains_hash(&hash));
+        assert!(!actor.missing_hashes.contains(&hash));
+
+        // Without any provider signal the entry is parked as before.
+        let other = Hash::new(b"content nobody announced");
+        let entry = crate::SignedEntry::from_parts(
+            &namespace_secret,
+            &author,
+            b"other",
+            crate::Record::new_current(other, 24),
+        );
+        actor
+            .on_replica_event(crate::Event::RemoteInsert {
+                namespace,
+                entry,
+                from: *relay.as_bytes(),
+                should_download: true,
+                remote_content_status: ContentStatus::Missing,
+            })
+            .await?;
+        assert_eq!(actor.download_tasks.len(), 1);
+        assert!(actor.missing_hashes.contains(&other));
         Ok(())
     }
 
