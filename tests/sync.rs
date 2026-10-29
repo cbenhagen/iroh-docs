@@ -150,11 +150,10 @@ async fn sync_with_custom_download_pool() -> Result<()> {
         .secret_key(SecretKey::from_bytes(&rng.random()))
         .bind()
         .await?;
+    let mut pool_options = connection_pool::Options::default();
+    pool_options.idle_timeout = Duration::from_secs(120);
     let node1 = Node::memory(ep1)
-        .download_pool_options(connection_pool::Options {
-            idle_timeout: Duration::from_secs(120),
-            ..Default::default()
-        })
+        .download_pool_options(pool_options)
         .spawn()
         .await?;
 
