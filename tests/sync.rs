@@ -150,11 +150,10 @@ async fn sync_with_custom_download_pool() -> Result<()> {
         .secret_key(SecretKey::from_bytes(&rng.random()))
         .bind()
         .await?;
+    let mut pool_options = connection_pool::Options::default();
+    pool_options.idle_timeout = Duration::from_secs(120);
     let node1 = Node::memory(ep1)
-        .download_pool_options(connection_pool::Options {
-            idle_timeout: Duration::from_secs(120),
-            ..Default::default()
-        })
+        .download_pool_options(pool_options)
         .spawn()
         .await?;
 
@@ -1658,8 +1657,10 @@ async fn sync_retries_blob_from_second_peer() -> Result<()> {
     )
     .await;
 
-    // B has the entry but not the blob
-    assert!(blobs_b.get_bytes(hash).await.is_err());
+    // B has the entry but not the blob. Check `has`, not `get_bytes`: since
+    // iroh-blobs 0.104 (#298), `get_bytes` on the mem store returns `Ok` with no
+    // data for the partial entry the failed fetch from C leaves behind.
+    assert!(!blobs_b.has(hash).await?);
 
     // B syncs with A — the post-sync incomplete blob check should discover and download it
     info!("B: sync with A");

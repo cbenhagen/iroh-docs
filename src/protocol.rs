@@ -143,7 +143,9 @@ impl Builder {
             }
         };
         let downloader = match self.download_pool_options {
-            Some(options) => Downloader::new_with_opts(&blobs, &endpoint, options),
+            Some(options) => Downloader::builder(&blobs, &endpoint)
+                .pool_options(options)
+                .build(),
             None => blobs.downloader(&endpoint),
         };
         let engine = Engine::spawn(
